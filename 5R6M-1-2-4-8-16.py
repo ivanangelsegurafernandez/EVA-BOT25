@@ -1010,12 +1010,9 @@ def write_token_atomic(path, content):
         return False
 
 
-# Orden operativo recomendado (calidad real primero):
-# 1) fulll47: mejor hit-rate y menor inflación del set comparado.
-# 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
-# 3) fulll48: intermedio, baja muestra.
-# 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
-BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
+# Universo oficial de esta fase: 10 bots visibles y evaluados en paralelo.
+# Mantener este censo como única fuente de verdad para HUD, lógica y control manual.
+BOT_NAMES = [f"fulll{i}" for i in range(45, 55)]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -10360,6 +10357,15 @@ def mostrar_panel():
         n_min_txt = f"{n_min_disp}/{n_req_real}" + (f" (+{n_min_extra} acum)" if n_min_extra > 0 else "")
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_txt} | Token: {owner_txt}")
 
+        ctt = _calcular_ctt_maestro()
+        print(
+            padding + Fore.GREEN +
+            f"🧠 CTT {ctt.get('state','CTT_BLOQUEADO')} | fase={ctt.get('phase','nacimiento')} | "
+            f"franja={float(ctt.get('green_mass',0.0))*100:.1f}% coh={float(ctt.get('cohesion',0.0))*100:.1f}% "
+            f"persist={int(ctt.get('persist',0))} div={float(ctt.get('diversity',0.0))*100:.0f}% | "
+            f"líder={ctt.get('leader') or '--'} | rez_sano={ctt.get('rezagado_sano') or '--'} | bloqueo={ctt.get('reason','--')}"
+        )
+
         try:
             meta_live = resolver_canary_estado(leer_model_meta() or {})
             reliable = bool(meta_live.get("reliable", False))
@@ -11985,6 +11991,141 @@ DYN_ROOF_MAX_CAP_WARMUP = 0.78
 REAL_COOLDOWN_UNTIL_TS = 0.0
 LAST_RETRAIN_ERROR = ""
 
+# =========================================================
+# CTT MAESTRO (contexto colectivo de 10 bots)
+# =========================================================
+CTT_RESULT_LOOKBACK = 8
+CTT_FRANJA_MIN_GREEN = 0.58
+CTT_FRANJA_MIN_COHESION = 0.52
+CTT_PERSIST_MIN_STREAK = 2
+CTT_PERSIST_STRONG_STREAK = 4
+CTT_DIVERSITY_MIN = 0.25
+CTT_SOFTEN_ALPHA = 0.60
+
+CTT_STATE = {
+    "state": "CTT_BLOQUEADO",
+    "phase": "nacimiento",
+    "reason": "init",
+    "green_mass": 0.0,
+    "cohesion": 0.0,
+    "persist": 0,
+    "diversity": 0.0,
+    "sm_green": 0.0,
+    "sm_cohesion": 0.0,
+    "leader": None,
+    "rezagado_sano": None,
+}
+
+
+def _resultado_es_verde(res) -> bool:
+    try:
+        r = str(res or "").strip().upper()
+        return r in {"GANANCIA", "WIN", "GREEN", "G"}
+    except Exception:
+        return False
+
+
+def _clasificar_rol_ctt(bot: str, ratio_bot: float, ratio_group: float, p_oper: float) -> str:
+    if ratio_bot >= (ratio_group + 0.18):
+        return "lider"
+    if ratio_bot >= (ratio_group - 0.04) and p_oper >= (float(_umbral_real_operativo_actual()) - 0.05):
+        return "rezagado_sano"
+    if ratio_bot >= (ratio_group - 0.10):
+        return "rezagado_neutro"
+    if p_oper < (float(_umbral_real_operativo_actual()) - 0.10):
+        return "rezagado_roto"
+    return "rezagado_tardio"
+
+
+def _calcular_ctt_maestro() -> dict:
+    try:
+        look = max(4, int(CTT_RESULT_LOOKBACK))
+        per_bot = {}
+        matriz = []
+        diversity_fingerprint = set()
+        for b in BOT_NAMES:
+            res = list(estado_bots.get(b, {}).get("resultados", []) or [])[-look:]
+            verdes = [1 if _resultado_es_verde(x) else 0 for x in res]
+            if verdes:
+                per_bot[b] = float(sum(verdes) / len(verdes))
+                diversity_fingerprint.add("".join(str(x) for x in verdes[-3:]))
+            else:
+                per_bot[b] = 0.0
+                diversity_fingerprint.add("na")
+            matriz.append(verdes)
+
+        cols = []
+        for c in range(look):
+            vals = []
+            for fila in matriz:
+                idx = len(fila) - look + c
+                if 0 <= idx < len(fila):
+                    vals.append(fila[idx])
+            if len(vals) >= max(4, int(len(BOT_NAMES) * 0.4)):
+                cols.append(float(sum(vals) / len(vals)))
+
+        green_mass = float(np.mean(list(per_bot.values()))) if per_bot else 0.0
+        cohesion = float(np.mean(cols[-3:])) if cols else 0.0
+
+        prev_sm_green = float(CTT_STATE.get("sm_green", 0.0) or 0.0)
+        prev_sm_cohesion = float(CTT_STATE.get("sm_cohesion", 0.0) or 0.0)
+        sm_green = float((CTT_SOFTEN_ALPHA * green_mass) + ((1.0 - CTT_SOFTEN_ALPHA) * prev_sm_green))
+        sm_cohesion = float((CTT_SOFTEN_ALPHA * cohesion) + ((1.0 - CTT_SOFTEN_ALPHA) * prev_sm_cohesion))
+
+        good_band = bool(sm_green >= float(CTT_FRANJA_MIN_GREEN) and sm_cohesion >= float(CTT_FRANJA_MIN_COHESION))
+        persist = int(CTT_STATE.get("persist", 0) or 0)
+        persist = (persist + 1) if good_band else max(0, persist - 1)
+
+        diversity = float(min(1.0, len(diversity_fingerprint) / max(1, len(BOT_NAMES))))
+        if not good_band:
+            state = "CTT_BLOQUEADO"
+            reason = "sin_franja_verde"
+        elif diversity < float(CTT_DIVERSITY_MIN):
+            state = "CTT_OBSERVAR"
+            reason = "diversidad_baja"
+        elif persist < int(CTT_PERSIST_MIN_STREAK):
+            state = "CTT_ZONA_VERDE_OPERABLE"
+            reason = "falta_persistencia"
+        elif persist < int(CTT_PERSIST_STRONG_STREAK):
+            state = "CTT_HABILITA_EVALUACION"
+            reason = "franja_estable"
+        else:
+            state = "CTT_HABILITA_PRIORIDAD_REAL"
+            reason = "franja_fuerte"
+
+        phase = "agotamiento" if (good_band and sm_green < prev_sm_green) else ("madurez" if persist >= int(CTT_PERSIST_STRONG_STREAK) else ("expansion" if good_band else "nacimiento"))
+
+        leader = None
+        rez_sano = None
+        if per_bot:
+            ratio_group = float(np.mean(list(per_bot.values())))
+            ranking = []
+            for b, rb in per_bot.items():
+                p_oper = float(_prob_ia_operativa_bot(b, default=0.0) or 0.0)
+                rol = _clasificar_rol_ctt(b, float(rb), ratio_group, p_oper)
+                estado_bots[b]["ctt_role"] = rol
+                ranking.append((float(rb), p_oper, b, rol))
+            ranking.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            leader = next((b for _r, _p, b, rol in ranking if rol == "lider"), ranking[0][2] if ranking else None)
+            rez_sano = next((b for _r, _p, b, rol in ranking if rol == "rezagado_sano"), None)
+
+        CTT_STATE.update({
+            "state": state,
+            "phase": phase,
+            "reason": reason,
+            "green_mass": float(green_mass),
+            "cohesion": float(cohesion),
+            "persist": int(persist),
+            "diversity": float(diversity),
+            "sm_green": float(sm_green),
+            "sm_cohesion": float(sm_cohesion),
+            "leader": leader,
+            "rezagado_sano": rez_sano,
+        })
+        return dict(CTT_STATE)
+    except Exception:
+        return dict(CTT_STATE)
+
 DYN_ROOF_STATE = {
     "tick": 0,
     "roof": float(max(DYN_ROOF_FLOOR, IA_OBJETIVO_REAL_THR)),
@@ -12932,7 +13073,8 @@ def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA
 
-    bot_map = {'5': 'fulll45', '6': 'fulll46', '7': 'fulll47', '8': 'fulll48', '9': 'fulll49', '0': 'fulll50'}
+    teclas_bots = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
+    bot_map = {k: b for k, b in zip(teclas_bots, BOT_NAMES)}
     last_key_time = 0  # debounce 200 ms
 
     while True:
@@ -13157,6 +13299,12 @@ def _boot_health_check():
             msgs.append("⚠️ No hay CSV enriquecidos de bots todavía; esperando generación de datos.")
         if not os.access(os.getcwd(), os.W_OK):
             msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
+        if len(BOT_NAMES) != 10:
+            msgs.append(f"⚠️ Universo de bots inconsistente: esperados=10, activos={len(BOT_NAMES)}.")
+        ctt_symbols = ["_calcular_ctt_maestro", "CTT_STATE", "CTT_RESULT_LOOKBACK"]
+        faltan_ctt = [s for s in ctt_symbols if s not in globals()]
+        if faltan_ctt:
+            msgs.append("⚠️ Arquitectura CTT incompleta: faltan " + ", ".join(faltan_ctt))
 
         # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
         sat_all = _auditar_saturacion_todos_bots(lookback=900)
@@ -13433,9 +13581,23 @@ async def main():
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
+                        ctt_ctx = _calcular_ctt_maestro()
+                        ctt_state = str(ctt_ctx.get("state", "CTT_BLOQUEADO") or "CTT_BLOQUEADO")
+                        ctt_open = ctt_state in {
+                            "CTT_ZONA_VERDE_OPERABLE",
+                            "CTT_HABILITA_EVALUACION",
+                            "CTT_HABILITA_PRIORIDAD_REAL",
+                        }
                         if not lock_activo:
+                            if not ctt_open:
+                                if ctt_state == "CTT_OBSERVAR":
+                                    agregar_evento(f"🟡 CTT en OBSERVAR ({ctt_ctx.get('reason','--')}). Solo diagnóstico, sin REAL.")
+                                else:
+                                    agregar_evento(f"🛑 CTT bloquea embudo REAL ({ctt_ctx.get('reason','--')}).")
                             for b in BOT_NAMES:
                                 try:
+                                    if not ctt_open:
+                                        continue
                                     modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
                                     if modo_b == "off":
                                         continue
@@ -13449,8 +13611,13 @@ async def main():
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
                                     piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                    p_penal = float(p)
                                     if float(p) < float(piso_operativo):
-                                        continue
+                                        deficit = float(piso_operativo - float(p))
+                                        # En CTT operable: penaliza, pero no aniquila la señal viva.
+                                        p_penal = float(max(0.0, float(p) - min(0.08, deficit * 0.75)))
+                                        if p_penal <= 0.0:
+                                            continue
 
                                     # Modo clásico reforzado: compuerta dinámica anti-bug.
                                     # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
@@ -13463,9 +13630,13 @@ async def main():
                                             continue
 
                                         regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
-                                        p_post = float(p)
+                                        p_post = float(p_penal)
                                         p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
-                                        score_final = float(max(0.0, min(1.0, p_rank)))
+                                        rol_ctt = str(estado_bots.get(b, {}).get("ctt_role", "rezagado_neutro"))
+                                        if rol_ctt in {"rezagado_roto", "rezagado_tardio"}:
+                                            continue
+                                        bonus_ctt = 0.02 if rol_ctt == "rezagado_sano" else (0.01 if rol_ctt == "lider" else -0.01)
+                                        score_final = float(max(0.0, min(1.0, p_rank + bonus_ctt)))
                                         estado_bots[b]["ia_regime_score"] = float(regime_score)
                                         estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
                                         estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
