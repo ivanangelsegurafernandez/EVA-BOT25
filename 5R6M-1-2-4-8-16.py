@@ -7369,6 +7369,31 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     # Regla de seguridad solicitada: nunca repetir bot en C2..C{MAX_CICLOS}.
     return None
 
+
+def resolver_candidato_real(candidatos: list, ciclo_objetivo: int):
+    """
+    Resuelve (candidato, ciclo_final) para la entrada REAL.
+
+    Si en C2..C{MAX_CICLOS} no existe bot nuevo elegible por rotación,
+    hace fallback a inversión mínima (C1) con el mejor candidato disponible.
+    """
+    try:
+        ciclo = int(ciclo_objetivo)
+    except Exception:
+        ciclo = 1
+
+    mejor = elegir_candidato_rotacion_marti(candidatos, ciclo)
+    if (mejor is not None) or (ciclo <= 1):
+        return mejor, ciclo
+
+    if not candidatos:
+        return None, ciclo
+
+    agregar_evento(
+        f"🟡 Rotación C{ciclo}: sin bot nuevo elegible. Fallback a inversión mínima C1 para no saltar señal."
+    )
+    return candidatos[0], 1
+
 # === FIN BLOQUE 9 ===
 
 # === BLOQUE 10 — IA: DATASET, MODELO Y PREDICCIÓN ===
@@ -13877,9 +13902,7 @@ async def main():
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                     ciclo_auto = 1
-                                mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
-                                if mejor is None and int(ciclo_auto) > 1:
-                                    agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot nuevo elegible. No se repite bot en esta martingala.")
+                                mejor, ciclo_final = resolver_candidato_real(candidatos, ciclo_auto)
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                     agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
@@ -14032,13 +14055,11 @@ async def main():
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
-                            mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
-                            if mejor is None and int(ciclo_auto) > 1:
-                                agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot nuevo elegible. Se omite entrada para evitar repetición.")
+                            mejor, ciclo_final = resolver_candidato_real(candidatos, ciclo_auto)
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                 agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
-                                monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
+                                monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_final - 1))]
                                 val = obtener_valor_saldo()
                                 if val is None or val < monto:
                                     pass
@@ -14049,10 +14070,10 @@ async def main():
                                     # Handoff entre ciclos REAL: si quedó lock residual de otro bot,
                                     # liberarlo antes de emitir la nueva orden para no bloquear rotación.
                                     owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-                                    if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
-                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
+                                    if owner_prev and owner_prev != mejor_bot and ciclo_final > 1:
+                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_final}→{mejor_bot}")
 
-                                    ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
+                                    ok_real = escribir_orden_real(mejor_bot, ciclo_final)
                                     if ok_real:
                                         if estado_real == "SHADOW":
                                             try:
@@ -14060,7 +14081,7 @@ async def main():
                                             except Exception:
                                                 pass
                                         estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
-                                        estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
+                                        estado_bots[mejor_bot]["ciclo_actual"] = ciclo_final
                                         activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
                                         marti_activa = True
                                     else:
